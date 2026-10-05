@@ -1,10 +1,10 @@
-name: AKROGOXI Pro Build
+name: AKROVIP Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -23,37 +23,206 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      # ── تم تعديل إصدار NDK ليتطابق مع ndkVersion في build.gradle ──
-      - name: Install NDK & CMake
+      # بدل setup-android@v3 اللي بيموت بسبب package 'tools' المحذوف
+      - name: Setup Android SDK manually
         run: |
-          echo "y" | sdkmanager "ndk;29.0.14033849"
-          echo "y" | sdkmanager "cmake;3.22.1"
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+
+      - name: Accept all SDK licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+
+      - name: Install NDK and CMake
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "platform-tools" \
+            "ndk;24.0.8215888" \
+            "cmake;3.22.1"
+
+      - name: Download fmt library
+        run: |
+          git clone --depth=1 --branch 10.2.1 https://github.com/fmtlib/fmt.git /tmp/fmt
+          mkdir -p app/src/main/cpp/EKO/src/third_party/fmt/include
+          cp -r /tmp/fmt/include/fmt app/src/main/cpp/EKO/src/third_party/fmt/include/
+          echo "[fmt] Installed:"
+          ls app/src/main/cpp/EKO/src/third_party/fmt/include/fmt/
+
+      - name: Download spdlog library
+        run: |
+          git clone --depth=1 --branch v1.13.0 https://github.com/gabime/spdlog.git /tmp/spdlog
+          mkdir -p app/src/main/cpp/EKO/src/third_party/spdlog/include
+          cp -r /tmp/spdlog/include/spdlog app/src/main/cpp/EKO/src/third_party/spdlog/include/
+          echo "[spdlog] Installed:"
+          ls app/src/main/cpp/EKO/src/third_party/spdlog/include/spdlog/
+
+      - name: Validate or generate Gradle wrapper
+        run: |
+          # لو الـ jar مش موجود في الـ repo نعمله generate
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "gradle-wrapper.jar not found — generating..."
+            mkdir -p gradle/wrapper
+            # نزل gradle binary مباشرة ونعمل wrapper
+            GRADLE_VERSION="8.7"
+            wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -O /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d /tmp/
+            /tmp/gradle-${GRADLE_VERSION}/bin/gradle wrapper --gradle-version ${GRADLE_VERSION} --distribution-type bin
+            echo "gradle-wrapper.jar generated successfully"
+          else
+            echo "gradle-wrapper.jar already exists"
+          fi
+          ls -la gradle/wrapper/
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Clean and Build APK
+      - name: Create local.properties
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/.cxx
+            app/build/intermediates/cxx
+          key: ${{ runner.os }}-ndk-${{ hashFiles('app/src/main/cpp/**') }}
+          restore-keys: ${{ runner.os }}-ndk-
+
+      - name: Build APK
         id: build
         run: |
-          ./gradlew clean assembleDebug assembleRelease --stacktrace 2>&1 | tee build_output.txt
+          ./gradlew assembleDebug assembleRelease --stacktrace 2>&1 | tee build_output.txt
           exit ${PIPESTATUS[0]}
+
+      - name: Generate Failure Report
+        if: failure()
+        run: |
+          python3 << 'EOF'
+          import os, re
+          from datetime import datetime
+
+          def read(p):
+              try:
+                  with open(p, 'r', errors='ignore') as f: return f.read()
+              except: return ""
+
+          build_log = read("build_output.txt")
+          now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+          lines = build_log.split('\n')
+          error_keywords = ['error:', 'fatal error:', 'FAILED', 'Exception', 'Could not',
+                            'not found', 'undefined reference', 'Caused by:', 'BUILD FAILED']
+
+          errors = []
+          for i, line in enumerate(lines):
+              if any(k in line for k in error_keywords):
+                  start = max(0, i - 2)
+                  end = min(len(lines), i + 8)
+                  block = '\n'.join(lines[start:end])
+                  if block not in errors:
+                      errors.append(block)
+
+          cpp_errors = re.findall(r'([^\s]+\.(?:cpp|hpp|h|c)):(\d+):\d+: (?:error|fatal error): (.+)', build_log)
+          failed_tasks = re.findall(r'> Task (.+?) FAILED', build_log)
+
+          report = []
+          report.append("=" * 70)
+          report.append("  EKOTURBO BUILD FAILURE REPORT")
+          report.append(f"  Date: {now}")
+          report.append("=" * 70)
+          report.append("\n[ FAILED TASKS ]")
+          report.append("-" * 70)
+          if failed_tasks:
+              for t in set(failed_tasks): report.append(f"  x {t}")
+          else:
+              report.append("  No specific tasks found")
+          report.append("\n[ C++ ERRORS ]")
+          report.append("-" * 70)
+          if cpp_errors:
+              seen = set()
+              for file, line, msg in cpp_errors:
+                  key = f"{file}:{line}"
+                  if key not in seen:
+                      seen.add(key)
+                      report.append(f"  File : {file}")
+                      report.append(f"  Line : {line}")
+                      report.append(f"  Error: {msg.strip()}")
+                      report.append("")
+          else:
+              report.append("  No C++ errors found")
+          report.append("\n[ FULL ERROR BLOCKS ]")
+          report.append("-" * 70)
+          if errors:
+              for i, err in enumerate(errors[:20], 1):
+                  report.append(f"\n--- Error #{i} ---")
+                  report.append(err)
+          else:
+              report.append("  No error blocks found")
+          report.append("\n[ FULL BUILD LOG ]")
+          report.append("-" * 70)
+          report.append(build_log)
+          report_text = '\n'.join(report)
+          with open("BUILD_FAILURE_REPORT.txt", 'w') as f:
+              f.write(report_text)
+          print(report_text[:3000])
+          EOF
+
+      - name: Upload Failure Report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUILD-FAILURE-REPORT-${{ github.run_number }}
+          path: BUILD_FAILURE_REPORT.txt
+          retention-days: 30
+
+      - name: Sign Release APK
+        if: success() && env.KEYSTORE_BASE64 != ''
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.jks
+          BUILD_TOOLS=$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)
+          $ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner sign \
+            --ks release.jks \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass pass:"$STORE_PASSWORD" \
+            --key-pass pass:"$KEY_PASSWORD" \
+            --out app/build/outputs/apk/release/app-release-signed.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk
+          rm -f release.jks
 
       - name: Get version info
         if: success()
         id: version
         run: |
+          VERSION=$(grep "versionName" app/build.gradle | awk '{print $2}' | tr -d '"' | head -1)
+          CODE=$(grep "versionCode" app/build.gradle | awk '{print $2}' | head -1)
+          echo "version_name=${VERSION:-1.0}" >> $GITHUB_OUTPUT
+          echo "version_code=${CODE:-1}" >> $GITHUB_OUTPUT
           echo "build_date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
 
       # ── رفع على GoFile (APK مباشر بدون zip) ──────────────────────────
       - name: Upload APKs to GoFile
         if: success()
         id: gofile
         run: |
-          # جيب أحسن server
           SERVER=$(curl -s "https://api.gofile.io/servers" | \
             python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data']['servers'][0]['name'])")
           echo "Server: $SERVER"
@@ -82,8 +251,8 @@ jobs:
           echo "DEBUG_LINK=$DEBUG_LINK" >> $GITHUB_OUTPUT
           echo "✅ Debug: $DEBUG_LINK"
 
-          echo "Uploading Release APK: $RELEASE_LINK"
-          RELEASE_LINK=$(upload_apk "$RELEASE_LINK")
+          echo "Uploading Release APK: $RELEASE_APK"
+          RELEASE_LINK=$(upload_apk "$RELEASE_APK")
           echo "RELEASE_LINK=$RELEASE_LINK" >> $GITHUB_OUTPUT
           echo "✅ Release: $RELEASE_LINK"
 
@@ -91,62 +260,49 @@ jobs:
       - name: Print Download Links
         if: success()
         run: |
-          echo "## 📦 AKROGOXI Build — ${{ steps.version.outputs.short_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 EKOTURBO Build — ${{ steps.version.outputs.version_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🌐 GoFile (APK مباشر)" >> $GITHUB_STEP_SUMMARY
           echo "| | Link |" >> $GITHUB_STEP_SUMMARY
           echo "|--|------|" >> $GITHUB_STEP_SUMMARY
           echo "| 🐛 Debug | ${{ steps.gofile.outputs.DEBUG_LINK }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🚀 Release | ${{ steps.gofile.outputs.RELEASE_LINK }} |" >> $GITHUB_STEP_SUMMARY
-
-      # ── GitHub Artifacts (احتياطي فقط، تتمسح بعد يوم) ───────────────
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📎 GitHub Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "| | Artifact |" >> $GITHUB_STEP_SUMMARY
+          echo "|--|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐛 Debug | EKOTURBO-Debug-v${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.build_date }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🚀 Release | EKOTURBO-Release-v${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.build_date }} |" >> $GITHUB_STEP_SUMMARY
       - name: Upload Debug APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Debug-${{ steps.version.outputs.short_sha }}
+          name: EKOTURBO-Debug-v${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.build_date }}
           path: app/build/outputs/apk/debug/*.apk
-          retention-days: 1
+          retention-days: 7
 
       - name: Upload Release APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Release-${{ steps.version.outputs.short_sha }}
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 1
+          name: EKOTURBO-Release-v${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.build_date }}
+          path: |
+            app/build/outputs/apk/release/*-unsigned.apk
+            app/build/outputs/apk/release/*-signed.apk
+          retention-days: 30
 
-      # ── Failure Report ─────────────────────────────────────────────────
-      - name: Generate Failure Report
-        if: failure()
-        run: |
-          python3 << 'PYEOF'
-          from datetime import datetime
-          def read(p):
-              try:
-                  with open(p, 'r', errors='ignore') as f: return f.read()
-              except: return ""
-          build_log = read("build_output.txt")
-          now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-          lines = build_log.split('\n')
-          error_keywords = ['error:', 'fatal error:', 'FAILED', 'Exception', 'AAPT: error:']
-          errors = []
-          for i, line in enumerate(lines):
-              if any(k in line for k in error_keywords):
-                  block = '\n'.join(lines[max(0,i-2):min(len(lines),i+8)])
-                  if block not in errors:
-                      errors.append(block)
-          report = ["="*70, "  AKROGOXI BUILD FAILURE REPORT", f"  Date: {now}", "="*70]
-          for i, err in enumerate(errors[:15], 1):
-              report += [f"\n--- Error #{i} ---", err]
-          with open("BUILD_FAILURE_REPORT.txt", 'w') as f:
-              f.write('\n'.join(report))
-          PYEOF
-
-      - name: Upload Failure Report
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        if: success() && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
-          name: FAILURE-REPORT
-          path: BUILD_FAILURE_REPORT.txt
-          retention-days: 1
+          name: EKOTURBO v${{ steps.version.outputs.version_name }}
+          body: |
+            ## EKOTURBO v${{ steps.version.outputs.version_name }}
+            - **Build:** ${{ steps.version.outputs.version_code }}
+            - **Date:** ${{ steps.version.outputs.build_date }}
+            - **NDK:** 26.1.10909125 | **ABI:** arm64-v8a
+          files: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
